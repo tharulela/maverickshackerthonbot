@@ -1,0 +1,21 @@
+{
+  "name": "WhatsApp Onboarding Flow",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "whatsapp-incoming",
+        "httpMethod": "POST",
+        "responseMode": "responseNode"
+      },
+      "id": "Webhook",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300]
+    }
+  ],
+  "connections": {},
+  "active": false,
+  "settings": {},
+  "versionId": "1"
+}

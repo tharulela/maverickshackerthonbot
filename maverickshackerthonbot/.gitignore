@@ -1,0 +1,7 @@
+node_modules
+dist
+.env
+auth
+data
+*.log
+.n8n

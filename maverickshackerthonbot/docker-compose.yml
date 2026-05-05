@@ -1,0 +1,57 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  session-api:
+    build:
+      context: ./apps/session-api
+    environment:
+      - PORT=4000
+      - REDIS_URL=${REDIS_URL}
+    ports:
+      - "4000:4000"
+    depends_on:
+      - redis
+
+  n8n:
+    image: n8nio/n8n:latest
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_HOST=localhost
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - WEBHOOK_URL=http://localhost:5678/
+      - N8N_ENCRYPTION_KEY=replace_me_with_long_random_string
+      - NODE_ENV=production
+    volumes:
+      - n8n_data:/home/node/.n8n
+
+  baileys-service:
+    build:
+      context: ./apps/baileys-service
+    environment:
+      - PORT=3000
+      - N8N_WEBHOOK_URL=${N8N_WEBHOOK_URL}
+      - SESSION_API_URL=http://session-api:4000
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - LOG_LEVEL=info
+    ports:
+      - "3000:3000"
+    depends_on:
+      - session-api
+      - n8n
+    volumes:
+      - ./apps/baileys-service/auth:/app/auth
+      - ./apps/baileys-service/data:/app/data
+
+volumes:
+  redis_data:
+  n8n_data:
