@@ -1,20 +1,137 @@
 {
-  "name": "WhatsApp Onboarding Flow",
+  "id": "whatsapp-onboarding-live-2",
+  "name": "WhatsApp Onboarding Flow Live",
   "nodes": [
     {
       "parameters": {
-        "path": "whatsapp-incoming",
+        "path": "whatsapp-incoming-live",
         "httpMethod": "POST",
-        "responseMode": "responseNode"
+        "responseMode": "responseNode",
+        "options": {}
       },
-      "id": "Webhook",
-      "name": "Webhook",
+      "id": "webhook-in",
+      "name": "Webhook In",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2,
       "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $json;\nconst text = (body.text || body.body || '').trim();\n\nreturn [{\n  json: {\n    messageId: body.messageId || body.id || '',\n    from: body.from || body.userId || '',\n    type: body.type || 'text',\n    text,\n    mediaPath: body.mediaPath || '',\n    languageHint: body.languageHint || '',\n    timestamp: body.timestamp || Date.now()\n  }\n}];"
+      },
+      "id": "normalize-input",
+      "name": "Normalize Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [480, 300]
+    },
+    {
+      "parameters": {
+        "url": "http://session-api:4000/session/{{$json.from}}",
+        "method": "GET",
+        "responseFormat": "json",
+        "options": {}
+      },
+      "id": "load-session",
+      "name": "Load Session",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [720, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const incoming = $items('Normalize Input')[0].json;\nconst sessionResult = $input.first().json;\nconst session = sessionResult.found ? sessionResult.session : { userId: incoming.from, step: 0, state: {} };\n\nlet step = session.step ?? 0;\nlet state = session.state ?? {};\nlet replyText = '';\nconst text = (incoming.text || '').trim();\n\nif (incoming.type === 'voice') {\n  replyText = 'Thanks for the voice note. I’m processing it now.';\n}\n\nif (step === 0) {\n  replyText = 'Hi! Welcome to onboarding. What is your full name?';\n  step = 1;\n} else if (step === 1) {\n  state.fullName = text;\n  replyText = 'Thanks. Which language would you like to continue in?';\n  step = 2;\n} else if (step === 2) {\n  state.language = text;\n  replyText = 'Great. Please share your email address.';\n  step = 3;\n} else if (step === 3) {\n  state.email = text;\n  replyText = 'What service are you interested in?';\n  step = 4;\n} else if (step === 4) {\n  state.service = text;\n  replyText = 'Thanks — your onboarding is complete.';\n  step = 5;\n} else {\n  replyText = 'You are already onboarded. Reply HELP for support.';\n}\n\nreturn [{\n  json: {\n    ...incoming,\n    session: { userId: incoming.from, step, state },\n    replyText\n  }\n}];"
+      },
+      "id": "onboarding-logic",
+      "name": "Onboarding Logic",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [960, 300]
+    },
+    {
+      "parameters": {
+        "url": "http://session-api:4000/session/{{$json.session.userId}}",
+        "method": "POST",
+        "sendBody": true,
+        "contentType": "json",
+        "bodyParametersJson": "={\"step\": $json.session.step, \"state\": $json.session.state}",
+        "options": {}
+      },
+      "id": "save-session",
+      "name": "Save Session",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1200, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\"replyText\": $items('Onboarding Logic')[0].json.replyText, \"session\": $items('Onboarding Logic')[0].json.session}"
+      },
+      "id": "respond",
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1440, 300]
     }
   ],
-  "connections": {},
+  "connections": {
+    "Webhook In": {
+      "main": [
+        [
+          {
+            "node": "Normalize Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Input": {
+      "main": [
+        [
+          {
+            "node": "Load Session",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Session": {
+      "main": [
+        [
+          {
+            "node": "Onboarding Logic",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Onboarding Logic": {
+      "main": [
+        [
+          {
+            "node": "Save Session",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Session": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
   "active": false,
   "settings": {},
   "versionId": "1"

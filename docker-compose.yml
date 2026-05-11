@@ -39,7 +39,7 @@ services:
       context: ./apps/baileys-service
     environment:
       - PORT=3000
-      - N8N_WEBHOOK_URL=${N8N_WEBHOOK_URL}
+      - N8N_WEBHOOK_URL=http://n8n:5678/webhook/whatsapp-incoming-live
       - SESSION_API_URL=http://session-api:4000
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - LOG_LEVEL=info
