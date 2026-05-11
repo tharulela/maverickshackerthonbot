@@ -12,11 +12,14 @@ async function main() {
   });
 
   await wa.onIncoming(async (msg) => {
-    const response = await fetch(`http://localhost:${config.PORT}/incoming`, {
+    const response = await fetch(
+      `http://localhost:${config.PORT}/whatsapp/webhook`,
+      {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(msg)
-    });
+      },
+    );
 
     if (!response.ok) {
       logger.warn({ status: response.status }, "Local webhook dispatch failed");

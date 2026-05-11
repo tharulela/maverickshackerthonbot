@@ -4,7 +4,7 @@ import { NormalizedIncomingMessage } from "../types.js";
 export async function normalizeMessage(
   message: proto.IWebMessageInfo,
   voiceText?: string,
-  mediaPath?: string
+  mediaPath?: string,
 ): Promise<NormalizedIncomingMessage> {
   const from = message.key.remoteJid!;
   const messageId = message.key.id!;
@@ -32,6 +32,30 @@ export async function normalizeMessage(
       text: voiceText,
       mimeType: m.audioMessage.mimetype || "audio/ogg",
       mediaPath
+    };
+  }
+
+  if (m.imageMessage) {
+    return {
+      messageId,
+      from,
+      timestamp,
+      type: "image",
+      mimeType: m.imageMessage.mimetype || "image/jpeg",
+      mediaPath,
+      text: m.imageMessage.caption,
+    };
+  }
+
+  if (m.documentMessage) {
+    return {
+      messageId,
+      from,
+      timestamp,
+      type: "document",
+      mimeType: m.documentMessage.mimetype || "application/octet-stream",
+      mediaPath,
+      text: m.documentMessage.caption,
     };
   }
 

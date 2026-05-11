@@ -9,7 +9,7 @@ import qrcode from "qrcode-terminal";
 import { logger } from "../logger.js";
 import { createTranscriber } from "../transcription/factory.js";
 import { normalizeMessage } from "./normalize.js";
-import { downloadVoiceNote } from "./media.js";
+import { downloadDocumentOrImage, downloadVoiceNote } from "./media.js";
 import { NormalizedIncomingMessage } from "../types.js";
 import { WhatsAppAdapter } from "./adapter.js";
 
@@ -79,6 +79,28 @@ export async function createBaileysAdapter(): Promise<WhatsAppAdapter> {
             voiceText = await transcriber.transcribeAudio(mediaPath);
           } catch (error) {
             logger.warn({ error }, "Voice note processing failed");
+          }
+        }
+
+        if (!mediaPath && message.message?.imageMessage) {
+          try {
+            mediaPath = await downloadDocumentOrImage(
+              message.message.imageMessage as any,
+              "image",
+            );
+          } catch (error) {
+            logger.warn({ error }, "Image download failed");
+          }
+        }
+
+        if (!mediaPath && message.message?.documentMessage) {
+          try {
+            mediaPath = await downloadDocumentOrImage(
+              message.message.documentMessage as any,
+              "document",
+            );
+          } catch (error) {
+            logger.warn({ error }, "Document download failed");
           }
         }
 

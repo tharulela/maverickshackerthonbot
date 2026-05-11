@@ -21,3 +21,24 @@ export async function downloadVoiceNote(message: any): Promise<string> {
 
   return filePath;
 }
+
+export async function downloadDocumentOrImage(
+  mediaMessage: any,
+  mediaType: "image" | "document",
+): Promise<string> {
+  const dir = "./data/media";
+  fs.mkdirSync(dir, { recursive: true });
+
+  const extension =
+    mediaType === "image"
+      ? ".jpg"
+      : mediaMessage?.fileName?.includes(".")
+        ? `.${String(mediaMessage.fileName).split(".").pop()}`
+        : ".bin";
+
+  const filePath = path.join(dir, `${randomUUID()}${extension}`);
+  const stream = await downloadContentFromMessage(mediaMessage, mediaType);
+  await streamToFile(stream, filePath);
+
+  return filePath;
+}

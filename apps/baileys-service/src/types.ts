@@ -1,4 +1,4 @@
-export type MessageType = "text" | "voice" | "unknown";
+export type MessageType = "text" | "voice" | "image" | "document" | "unknown";
 
 export interface NormalizedIncomingMessage {
   messageId: string;
