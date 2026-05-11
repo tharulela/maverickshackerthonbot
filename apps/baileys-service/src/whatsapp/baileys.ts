@@ -75,7 +75,7 @@ export async function createBaileysAdapter(): Promise<WhatsAppAdapter> {
 
         if (message.message?.audioMessage) {
           try {
-            mediaPath = await downloadVoiceNote(message as any);
+            mediaPath = await downloadVoiceNote(message);
             voiceText = await transcriber.transcribeAudio(mediaPath);
           } catch (error) {
             logger.warn({ error }, "Voice note processing failed");
@@ -85,7 +85,7 @@ export async function createBaileysAdapter(): Promise<WhatsAppAdapter> {
         if (!mediaPath && message.message?.imageMessage) {
           try {
             mediaPath = await downloadDocumentOrImage(
-              message.message.imageMessage as any,
+              message.message.imageMessage,
               "image",
             );
           } catch (error) {
@@ -96,7 +96,7 @@ export async function createBaileysAdapter(): Promise<WhatsAppAdapter> {
         if (!mediaPath && message.message?.documentMessage) {
           try {
             mediaPath = await downloadDocumentOrImage(
-              message.message.documentMessage as any,
+              message.message.documentMessage,
               "document",
             );
           } catch (error) {

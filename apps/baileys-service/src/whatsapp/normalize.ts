@@ -43,7 +43,7 @@ export async function normalizeMessage(
       type: "image",
       mimeType: m.imageMessage.mimetype || "image/jpeg",
       mediaPath,
-      text: m.imageMessage.caption,
+      text: m.imageMessage.caption ?? undefined,
     };
   }
 
@@ -55,7 +55,7 @@ export async function normalizeMessage(
       type: "document",
       mimeType: m.documentMessage.mimetype || "application/octet-stream",
       mediaPath,
-      text: m.documentMessage.caption,
+      text: m.documentMessage.caption ?? undefined,
     };
   }
 

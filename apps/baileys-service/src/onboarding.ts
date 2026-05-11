@@ -1,5 +1,4 @@
 import { createHmac, randomUUID } from "node:crypto";
-import { promises as fs } from "node:fs";
 import { config } from "./config.js";
 import { logger } from "./logger.js";
 import { NormalizedIncomingMessage } from "./types.js";
@@ -116,6 +115,23 @@ interface BackendApplication {
   raw?: Record<string, unknown>;
 }
 
+interface BackendApplicationApiItem {
+  id?: string;
+  applicationId?: string;
+  status?: string;
+  fields?: Record<string, unknown>;
+  applicationFields?: Record<string, unknown>;
+  DOCUMENT_SELFIE_RESOURCE_URI?: string;
+  [key: string]: unknown;
+}
+
+interface DhaDetailsResponse {
+  hasPhoto?: boolean;
+  dateOfBirth?: string;
+  isSouthAfricanCitizen?: boolean;
+  [key: string]: unknown;
+}
+
 interface BackendClientConfig {
   timeoutMs: number;
   authToken?: string;
@@ -128,7 +144,7 @@ class BackendClient {
   async findInProgressApplication(
     merchantId: string,
   ): Promise<BackendApplication | null> {
-    const data = await this.requestJson<any[]>(
+    const data = await this.requestJson<BackendApplicationApiItem[]>(
       "GET",
       this.onboardingPath(
         `/onboarding/v1/merchants/${encodeURIComponent(merchantId)}/applications`,
@@ -161,7 +177,7 @@ class BackendClient {
     merchantId: string,
     applicationId: string,
   ): Promise<BackendApplication | null> {
-    const data = await this.requestJson<any[]>(
+    const data = await this.requestJson<BackendApplicationApiItem[]>(
       "GET",
       this.onboardingPath(
         `/onboarding/v1/merchants/${encodeURIComponent(merchantId)}/applications`,
@@ -250,7 +266,7 @@ class BackendClient {
     );
   }
 
-  async getDhaDetails(personalIdNumber: string): Promise<Record<string, unknown>> {
+  async getDhaDetails(personalIdNumber: string): Promise<DhaDetailsResponse> {
     return await this.requestJson(
       "GET",
       this.relyPath(
@@ -448,7 +464,8 @@ function extractDateFromSouthAfricanId(idNumber: string): string | undefined {
   const currentTwoDigitYear = Number(
     String(new Date().getUTCFullYear()).slice(-2),
   );
-  const century = yy <= currentTwoDigitYear ? 2000 : 1900;
+  const futureToleranceYears = 10;
+  const century = yy <= currentTwoDigitYear + futureToleranceYears ? 2000 : 1900;
   const year = century + yy;
 
   const date = new Date(Date.UTC(year, mm - 1, dd));
@@ -477,21 +494,33 @@ function normalizeBankName(raw: string | undefined): string | undefined {
 }
 
 async function safeReadMediaFile(mediaPath?: string): Promise<string> {
-  if (!mediaPath) {
-    return "";
-  }
+  void mediaPath;
+  return "";
+}
 
-  const allowedPrefixes = ["./data/", "data/", "/app/data/"];
-  if (!allowedPrefixes.some((prefix) => mediaPath.startsWith(prefix))) {
-    return "";
-  }
-
-  try {
-    const buf = await fs.readFile(mediaPath);
-    return buf.toString("utf-8");
-  } catch {
-    return "";
-  }
+function hydrateStateFromFields(
+  state: OnboardingState,
+  fields: Record<string, unknown>,
+): OnboardingState {
+  return {
+    ...state,
+    businessName: String(fields.BUSINESS_REGISTERED_NAME ?? state.businessName ?? ""),
+    businessDescription: String(
+      fields.BUSINESS_DESCRIPTION ?? state.businessDescription ?? "",
+    ),
+    mccCode: String(fields.BUSINESS_MCC_CODE ?? state.mccCode ?? ""),
+    principalIdNumber: String(
+      fields.PRINCIPAL_ID_NUMBER ?? state.principalIdNumber ?? "",
+    ),
+    userDateOfBirth: String(fields.USER_DATE_OF_BIRTH ?? state.userDateOfBirth ?? ""),
+    bankName: String(fields.BANK_NAME ?? state.bankName ?? ""),
+    bankAccountNumber: String(
+      fields.BANK_ACCOUNT_NUMBER ?? state.bankAccountNumber ?? "",
+    ),
+    bankAccountHolderName: String(
+      fields.BANK_ACCOUNT_HOLDER_NAME ?? state.bankAccountHolderName ?? "",
+    ),
+  };
 }
 
 export async function runOcrExtract(
@@ -609,6 +638,18 @@ function terminal(
   };
 }
 
+function maskSensitive(value: string | undefined, keepLast = 4): string {
+  if (!value) {
+    return "";
+  }
+
+  const sanitized = value.replace(/\s+/g, "");
+  if (sanitized.length <= keepLast) {
+    return "*".repeat(sanitized.length);
+  }
+  return `${"*".repeat(Math.max(0, sanitized.length - keepLast))}${sanitized.slice(-keepLast)}`;
+}
+
 async function runEditFlow(
   state: OnboardingState,
   text: string,
@@ -688,7 +729,7 @@ async function ensureEntryState(
 
   if (inProgress?.applicationId) {
     nextState = {
-      ...nextState,
+      ...hydrateStateFromFields(nextState, inProgress.fields ?? {}),
       applicationId: inProgress.applicationId,
       step: inferStepFromApplicationFields(inProgress.fields ?? {}) ?? "BUSINESS_NAME",
     };
@@ -740,7 +781,7 @@ async function handleHelpFlow(
 
     if (normalized === "2" || normalized.includes("change")) {
       return {
-        state: { ...state, helpActive: false, editField: "BUSINESS_REGISTERED_NAME" },
+        state: { ...state, helpActive: false },
         reply: "What would you like to change? (business name, business address, residential address, bank)",
       };
     }
@@ -946,7 +987,7 @@ export async function processOnboardingMessage(
     const idNumber = ocr.principalIdNumber;
     let dob = ocr.userDateOfBirth ?? extractDateFromSouthAfricanId(idNumber);
     let dhaHasPhoto = false;
-    let isSouthAfricanCitizen = ocr.isSouthAfricanCitizen !== false;
+    let isSouthAfricanCitizen: boolean = ocr.isSouthAfricanCitizen ?? true;
 
     try {
       const dha = await backendClient.getDhaDetails(idNumber);
@@ -1028,7 +1069,7 @@ export async function processOnboardingMessage(
     const pathNote = dhaHasPhoto
       ? "DHA photo found, so selfie handoff later will be enough."
       : "DHA photo missing; we will rely on your uploaded ID plus selfie handoff.";
-    const reply = `I extracted:\n- ID number: ${idNumber}\n- Date of birth: ${dob}\n${pathNote}\nReply YES to confirm or NO to retry.`;
+    const reply = `I extracted:\n- ID number: ${maskSensitive(idNumber)}\n- Date of birth: ${dob}\n${pathNote}\nReply YES to confirm or NO to retry.`;
     return { replyText: reply, state: { ...nextState, lastPrompt: reply } };
   }
 
@@ -1036,7 +1077,11 @@ export async function processOnboardingMessage(
     const normalized = text.toLowerCase();
     if (normalized !== "yes" && normalized !== "y") {
       const retries = (state.idDocRetries ?? 0) + 1;
-      const nextState = { ...state, step: "ID_DOCUMENT", idDocRetries: retries };
+      const nextState: OnboardingState = {
+        ...state,
+        step: "ID_DOCUMENT",
+        idDocRetries: retries,
+      };
       const reply = "No problem — please re-upload your SA ID document.";
       return { replyText: reply, state: { ...nextState, lastPrompt: reply } };
     }
@@ -1154,7 +1199,7 @@ export async function processOnboardingMessage(
       };
     }
 
-    const reply = `I extracted:\n- Bank: ${nextState.bankName}\n- Account number: ${nextState.bankAccountNumber}\n- Account holder: ${nextState.bankAccountHolderName}\nReply YES to confirm or NO to retry.`;
+    const reply = `I extracted:\n- Bank: ${nextState.bankName}\n- Account number: ${maskSensitive(nextState.bankAccountNumber)}\n- Account holder: ${nextState.bankAccountHolderName}\nReply YES to confirm or NO to retry.`;
     return {
       replyText: reply,
       state: {
@@ -1181,7 +1226,7 @@ export async function processOnboardingMessage(
       BANK_ACCOUNT_TYPE: "CURRENT",
     });
 
-    const reply = `Thanks. Please confirm:\n- Bank: ${nextState.bankName}\n- Account number: ${nextState.bankAccountNumber}\n- Account holder: ${nextState.bankAccountHolderName}\nReply YES to confirm or NO to retry.`;
+    const reply = `Thanks. Please confirm:\n- Bank: ${nextState.bankName}\n- Account number: ${maskSensitive(nextState.bankAccountNumber)}\n- Account holder: ${nextState.bankAccountHolderName}\nReply YES to confirm or NO to retry.`;
     return {
       replyText: reply,
       state: {

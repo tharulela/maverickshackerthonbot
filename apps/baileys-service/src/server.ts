@@ -12,6 +12,7 @@ import {
 
 const FALLBACK_REPLY =
   "Meow! Thanks for your message. I am currently being built and will be up and running soon.";
+const webhookRateLimit = new Map<string, { count: number; windowStart: number }>();
 
 async function loadSession(userId: string): Promise<SessionRecord> {
   const response = await fetch(
@@ -59,7 +60,9 @@ async function dedupeMessage(messageId: string): Promise<boolean> {
   );
 
   if (!response.ok) {
-    throw new Error(`dedupe check failed: ${response.status} ${response.statusText}`);
+    throw new Error(
+      `dedupe check failed for message ${messageId}: ${response.status} ${response.statusText}`,
+    );
   }
 
   const payload = (await response.json()) as { deduped: boolean };
@@ -73,6 +76,66 @@ function isWebhookAuthorized(req: express.Request): boolean {
 
   const provided = req.header("x-webhook-secret");
   return provided === config.WHATSAPP_WEBHOOK_SECRET;
+}
+
+function isRateLimited(req: express.Request, key: string): boolean {
+  const now = Date.now();
+  const identifier = `${req.ip ?? "unknown"}:${key}`;
+  const existing = webhookRateLimit.get(identifier);
+
+  if (
+    !existing ||
+    now - existing.windowStart >= config.WEBHOOK_RATE_LIMIT_WINDOW_MS
+  ) {
+    webhookRateLimit.set(identifier, { count: 1, windowStart: now });
+    return false;
+  }
+
+  if (existing.count >= config.WEBHOOK_RATE_LIMIT_MAX_REQUESTS) {
+    return true;
+  }
+
+  existing.count += 1;
+  webhookRateLimit.set(identifier, existing);
+  return false;
+}
+
+function webhookGuardMiddleware(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction,
+) {
+  if (!isWebhookAuthorized(req)) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+
+  const payload = req.body as Partial<NormalizedIncomingMessage> | undefined;
+  const from = payload?.from ?? "unknown";
+  if (isRateLimited(req, from)) {
+    return res.status(429).json({ ok: false, error: "Rate limit exceeded" });
+  }
+  next();
+}
+
+function stepToNumber(step: string): number {
+  const orderedSteps = [
+    "ENTRY",
+    "BUSINESS_NAME",
+    "BUSINESS_DESCRIPTION",
+    "BUSINESS_ADDRESS",
+    "ID_DOCUMENT",
+    "ID_CONFIRM",
+    "RESIDENTIAL_ADDRESS",
+    "BANK_DOCUMENT",
+    "BANK_ACCOUNT_HOLDER",
+    "BANK_CONFIRM",
+    "SELFIE_WAIT",
+    "COMPLETED",
+    "TERMINAL",
+  ];
+
+  const index = orderedSteps.indexOf(step);
+  return index >= 0 ? index : 0;
 }
 
 export function createServer(
@@ -128,13 +191,8 @@ export function createServer(
     }
   });
 
-  app.post("/whatsapp/webhook", async (req, res) => {
-    if (!isWebhookAuthorized(req)) {
-      return res.status(401).json({ ok: false, error: "Unauthorized" });
-    }
-
+  const webhookHandler = async (req: express.Request, res: express.Response) => {
     const payload = req.body as NormalizedIncomingMessage;
-
     try {
       logger.info(
         { payload },
@@ -151,7 +209,7 @@ export function createServer(
 
       await saveSession({
         userId: payload.from,
-        step: session.step + 1,
+        step: stepToNumber(result.state.step),
         state: result.state,
       });
       await sendReplyToWhatsApp(payload.from, result.replyText);
@@ -168,12 +226,18 @@ export function createServer(
 
       res.status(500).json({ ok: false, fallbackSent: true });
     }
-  });
+  };
 
-  app.post("/incoming", async (req, res) => {
-    req.url = "/whatsapp/webhook";
-    app.handle(req, res);
-  });
+  app.post(
+    "/whatsapp/webhook",
+    webhookGuardMiddleware,
+    webhookHandler,
+  );
+  app.post(
+    "/incoming",
+    webhookGuardMiddleware,
+    webhookHandler,
+  );
 
   return app;
 }
