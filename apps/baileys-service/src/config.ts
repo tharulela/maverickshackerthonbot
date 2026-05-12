@@ -14,6 +14,7 @@ const schema = z.object({
   RELY_COMPLY_BASE_URL: z.string().url().optional(),
   HSPROXY_BASE_URL: z.string().url().optional(),
   MCC_CLASSIFIER_URL: z.string().url().optional(),
+  MOCK_BACKEND: z.coerce.boolean().default(false),
   BACKEND_AUTH_TOKEN: z.string().optional(),
   BACKEND_AUTH_HEADER: z.string().default("Authorization"),
   WHATSAPP_WEBHOOK_SECRET: z.string().optional(),
@@ -22,7 +23,10 @@ const schema = z.object({
   REQUEST_TIMEOUT_MS: z.coerce.number().default(15000),
   OCR_RETRY_LIMIT: z.coerce.number().default(2),
   IS_AI_POWERED_MCC_ENABLED: z.coerce.boolean().default(false),
-  SELFIE_BASE_URL: z.string().url().default("https://selfie.example.com/capture"),
+  SELFIE_BASE_URL: z
+    .string()
+    .url()
+    .default("https://selfie.example.com/capture"),
   SELFIE_LINK_SECRET: z.string().min(32),
   SELFIE_LINK_TTL_SECONDS: z.coerce.number().default(900),
 });

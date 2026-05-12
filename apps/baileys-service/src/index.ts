@@ -22,12 +22,16 @@ async function main() {
     );
 
     if (!response.ok) {
-      logger.warn({ status: response.status }, "Local webhook dispatch failed");
+      const responseBody = await response.text().catch(() => "");
+      logger.warn(
+        { status: response.status, responseBody },
+        "Local webhook dispatch failed",
+      );
     }
   });
 }
 
 main().catch((error) => {
-  logger.error({ error }, "Fatal startup failure");
+  logger.error({ err: error }, "Fatal startup failure");
   process.exit(1);
 });

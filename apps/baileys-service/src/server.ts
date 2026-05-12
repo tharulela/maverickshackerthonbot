@@ -12,7 +12,24 @@ import {
 
 const FALLBACK_REPLY =
   "Meow! Thanks for your message. I am currently being built and will be up and running soon.";
-const webhookRateLimit = new Map<string, { count: number; windowStart: number }>();
+const webhookRateLimit = new Map<
+  string,
+  { count: number; windowStart: number }
+>();
+
+function isBackendConnectivityError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  const text = [error.message, error.stack ?? ""].join(" ");
+  return (
+    text.includes("fetch failed") ||
+    text.includes("ECONNREFUSED") ||
+    text.includes("ENOTFOUND") ||
+    text.includes("ETIMEDOUT")
+  );
+}
 
 async function loadSession(userId: string): Promise<SessionRecord> {
   const response = await fetch(
@@ -166,7 +183,7 @@ export function createServer(
 
       res.json({ ok: true, result });
     } catch (error) {
-      logger.error({ error }, "OCR extraction failed");
+      logger.error({ err: error }, "OCR extraction failed");
       res.status(500).json({ ok: false });
     }
   });
@@ -183,15 +200,21 @@ export function createServer(
         });
       }
 
-      const payload = await createSelfieLinkPayload({ merchantId, applicationId });
+      const payload = await createSelfieLinkPayload({
+        merchantId,
+        applicationId,
+      });
       res.json({ ok: true, ...payload });
     } catch (error) {
-      logger.error({ error }, "Failed to create selfie link");
+      logger.error({ err: error }, "Failed to create selfie link");
       res.status(500).json({ ok: false });
     }
   });
 
-  const webhookHandler = async (req: express.Request, res: express.Response) => {
+  const webhookHandler = async (
+    req: express.Request,
+    res: express.Response,
+  ) => {
     const payload = req.body as NormalizedIncomingMessage;
     try {
       logger.info(
@@ -216,28 +239,30 @@ export function createServer(
 
       res.json({ ok: true });
     } catch (error) {
-      logger.error({ error }, "Failed to process incoming webhook");
+      if (isBackendConnectivityError(error)) {
+        logger.warn(
+          { err: error },
+          "Onboarding backend unavailable; fallback reply sent",
+        );
+      } else {
+        logger.error({ err: error }, "Failed to process incoming webhook");
+      }
 
       try {
         await sendReplyToWhatsApp(payload.from, FALLBACK_REPLY);
       } catch (sendError) {
-        logger.error({ sendError }, "Failed to send fallback reply");
+        logger.error({ err: sendError }, "Failed to send fallback reply");
       }
 
-      res.status(500).json({ ok: false, fallbackSent: true });
+      // We intentionally return 200 because the error is handled with a fallback
+      // WhatsApp reply. This prevents upstream dispatch retries/noise when
+      // external onboarding backends are temporarily unavailable.
+      res.status(200).json({ ok: false, fallbackSent: true, handled: true });
     }
   };
 
-  app.post(
-    "/whatsapp/webhook",
-    webhookGuardMiddleware,
-    webhookHandler,
-  );
-  app.post(
-    "/incoming",
-    webhookGuardMiddleware,
-    webhookHandler,
-  );
+  app.post("/whatsapp/webhook", webhookGuardMiddleware, webhookHandler);
+  app.post("/incoming", webhookGuardMiddleware, webhookHandler);
 
   return app;
 }

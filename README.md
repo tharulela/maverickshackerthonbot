@@ -18,6 +18,11 @@ WhatsApp onboarding system using Baileys, Redis session storage, and backend onb
 2. Run `docker compose up --build`
 3. Scan the QR code in the Baileys logs
 
+## Troubleshooting
+- If logs show `fetch failed: connect ECONNREFUSED ...:8080`, the external onboarding backend is not reachable from the `baileys-service` container.
+- Set `IKHOKHA_BASE_URL`, `PROFILE_BASE_URL`, `RELY_COMPLY_BASE_URL`, and `HSPROXY_BASE_URL` in `.env` to a reachable backend URL for your environment.
+- If the backend runs on your host machine, ensure it is listening on the configured port and accessible from Docker (default uses `host.docker.internal`).
+
 ## Core flow (POC)
 1. Onboarding entry + resume detection
 2. Business capture (+ optional AI MCC description branch)

@@ -42,6 +42,16 @@ services:
       - N8N_WEBHOOK_URL=http://n8n:5678/webhook/whatsapp-incoming-live
       - SESSION_API_URL=http://session-api:4000
       - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - MOCK_BACKEND=${MOCK_BACKEND:-true}
+      - IKHOKHA_BASE_URL=${IKHOKHA_BASE_URL:-http://host.docker.internal:8080}
+      - PROFILE_BASE_URL=${PROFILE_BASE_URL:-http://host.docker.internal:8080}
+      - RELY_COMPLY_BASE_URL=${RELY_COMPLY_BASE_URL:-http://host.docker.internal:8080}
+      - HSPROXY_BASE_URL=${HSPROXY_BASE_URL:-http://host.docker.internal:8080}
+      - MCC_CLASSIFIER_URL=${MCC_CLASSIFIER_URL:-http://host.docker.internal:8080/api/classify-business-industry}
+      - BACKEND_AUTH_TOKEN=${BACKEND_AUTH_TOKEN}
+      - BACKEND_AUTH_HEADER=${BACKEND_AUTH_HEADER:-Authorization}
+      - SELFIE_LINK_SECRET=${SELFIE_LINK_SECRET}
+      - REQUEST_TIMEOUT_MS=${REQUEST_TIMEOUT_MS:-15000}
       - LOG_LEVEL=info
     ports:
       - "3000:3000"

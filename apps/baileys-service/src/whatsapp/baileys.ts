@@ -20,6 +20,10 @@ export async function createBaileysAdapter(): Promise<WhatsAppAdapter> {
   const socket = makeWASocket({
     auth: state,
     version,
+    // This bot only needs live inbound events and sendMessage.
+    // Disabling init queries avoids noisy startup 408 timeouts from WA fetchProps.
+    fireInitQueries: false,
+    syncFullHistory: false,
   });
 
   const transcriber = createTranscriber();

@@ -1,4 +1,8 @@
 import { createHmac, randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
+import axios from "axios";
+import { PDFParse } from "pdf-parse";
 import { config } from "./config.js";
 import { logger } from "./logger.js";
 import { NormalizedIncomingMessage } from "./types.js";
@@ -13,12 +17,43 @@ const SUPPORTED_BANKS = [
   "Nedbank",
   "Standard Bank",
   "TymeBank",
+  "GoTyme Bank",
   "African Bank",
   "Bidvest",
   "Discovery Bank",
   "Investec",
   "Sasfin",
   "Ubank",
+];
+
+const BANK_ALIASES: Array<{ alias: string; bank: string }> = [
+  { alias: "first national bank", bank: "FNB" },
+  { alias: "first national", bank: "FNB" },
+  { alias: "fnb", bank: "FNB" },
+  { alias: "f n b", bank: "FNB" },
+  { alias: "firstrand", bank: "FNB" },
+  { alias: "capitec bank", bank: "Capitec" },
+  { alias: "capitecbank", bank: "Capitec" },
+  { alias: "nedbank", bank: "Nedbank" },
+  { alias: "nedbank limited", bank: "Nedbank" },
+  { alias: "standard bank", bank: "Standard Bank" },
+  { alias: "standardbank", bank: "Standard Bank" },
+  { alias: "standard bank of south africa", bank: "Standard Bank" },
+  { alias: "absa", bank: "ABSA" },
+  { alias: "absa bank", bank: "ABSA" },
+  { alias: "absa bank limited", bank: "ABSA" },
+  { alias: "tymebank", bank: "TymeBank" },
+  { alias: "tyme bank", bank: "TymeBank" },
+  { alias: "gotyme", bank: "GoTyme Bank" },
+  { alias: "gotyme bank", bank: "GoTyme Bank" },
+  { alias: "go tyme", bank: "GoTyme Bank" },
+  { alias: "go tyme bank", bank: "GoTyme Bank" },
+  { alias: "african bank", bank: "African Bank" },
+  { alias: "bidvest", bank: "Bidvest" },
+  { alias: "discovery bank", bank: "Discovery Bank" },
+  { alias: "investec", bank: "Investec" },
+  { alias: "sasfin", bank: "Sasfin" },
+  { alias: "ubank", bank: "Ubank" },
 ];
 
 const EDITABLE_FIELDS: Record<string, string> = {
@@ -41,6 +76,8 @@ export type OnboardingStep =
   | "ID_CONFIRM"
   | "RESIDENTIAL_ADDRESS"
   | "BANK_DOCUMENT"
+  | "BANK_ACCOUNT_NUMBER"
+  | "BANK_NAME"
   | "BANK_ACCOUNT_HOLDER"
   | "BANK_CONFIRM"
   | "SELFIE_WAIT"
@@ -62,6 +99,8 @@ export interface OnboardingState {
   businessAddress?: ParsedAddress;
   mccCode?: string;
   principalIdNumber?: string;
+  principalFirstName?: string;
+  principalLastName?: string;
   userDateOfBirth?: string;
   userIsSouthAfricanCitizen?: boolean;
   dhaHasPhoto?: boolean;
@@ -102,6 +141,8 @@ export interface OcrExtractResponse {
   documentKind?: "sa_id" | "passport" | "bank_document" | "unknown";
   isSouthAfricanCitizen?: boolean;
   principalIdNumber?: string;
+  principalFirstName?: string;
+  principalLastName?: string;
   userDateOfBirth?: string;
   bankName?: string;
   bankAccountNumber?: string;
@@ -138,12 +179,39 @@ interface BackendClientConfig {
   authHeader: string;
 }
 
+interface MockBackendApplication {
+  applicationId: string;
+  status: string;
+  fields: Record<string, unknown>;
+}
+
 class BackendClient {
+  private static readonly mockApplications = new Map<
+    string,
+    MockBackendApplication
+  >();
+  private static mockModeLogged = false;
+  private readonly useMockBackend = config.MOCK_BACKEND;
+
   constructor(private readonly cfg: BackendClientConfig) {}
 
   async findInProgressApplication(
     merchantId: string,
   ): Promise<BackendApplication | null> {
+    if (this.useMockBackend) {
+      const app = this.getMockApplication(merchantId);
+      if (!app) {
+        return null;
+      }
+
+      return {
+        applicationId: app.applicationId,
+        status: app.status,
+        fields: app.fields,
+        raw: { ...app.fields },
+      };
+    }
+
     const data = await this.requestJson<BackendApplicationApiItem[]>(
       "GET",
       this.onboardingPath(
@@ -177,6 +245,20 @@ class BackendClient {
     merchantId: string,
     applicationId: string,
   ): Promise<BackendApplication | null> {
+    if (this.useMockBackend) {
+      const app = this.getMockApplication(merchantId);
+      if (!app || app.applicationId !== applicationId) {
+        return null;
+      }
+
+      return {
+        applicationId: app.applicationId,
+        status: app.status,
+        fields: app.fields,
+        raw: { ...app.fields },
+      };
+    }
+
     const data = await this.requestJson<BackendApplicationApiItem[]>(
       "GET",
       this.onboardingPath(
@@ -203,6 +285,16 @@ class BackendClient {
   }
 
   async createApplication(merchantId: string): Promise<string> {
+    if (this.useMockBackend) {
+      const applicationId = `mock-app-${randomUUID()}`;
+      this.setMockApplication(merchantId, {
+        applicationId,
+        status: "IN_PROGRESS",
+        fields: { BUSINESS_TYPE: "SOLE_PROPRIETOR" },
+      });
+      return applicationId;
+    }
+
     const body = {
       businessType: "SOLE_PROPRIETOR",
       BUSINESS_TYPE: "SOLE_PROPRIETOR",
@@ -227,6 +319,19 @@ class BackendClient {
     applicationId: string,
     fields: Record<string, unknown>,
   ): Promise<void> {
+    if (this.useMockBackend) {
+      const existing = this.getMockApplication(merchantId);
+      this.setMockApplication(merchantId, {
+        applicationId,
+        status: existing?.status ?? "IN_PROGRESS",
+        fields: {
+          ...(existing?.fields ?? {}),
+          ...fields,
+        },
+      });
+      return;
+    }
+
     await this.requestJson(
       "PUT",
       this.onboardingPath(
@@ -242,6 +347,16 @@ class BackendClient {
     merchantId: string,
     applicationId: string,
   ): Promise<void> {
+    if (this.useMockBackend) {
+      const existing = this.getMockApplication(merchantId);
+      this.setMockApplication(merchantId, {
+        applicationId,
+        status: "COMPLETED",
+        fields: existing?.fields ?? {},
+      });
+      return;
+    }
+
     await this.requestJson(
       "PUT",
       this.onboardingPath(
@@ -257,6 +372,17 @@ class BackendClient {
     merchantId: string,
     payload: Record<string, unknown>,
   ): Promise<void> {
+    if (this.useMockBackend) {
+      const existing = this.getMockApplication(merchantId);
+      if (existing) {
+        this.setMockApplication(merchantId, {
+          ...existing,
+          fields: { ...existing.fields, ...payload },
+        });
+      }
+      return;
+    }
+
     await this.requestJson(
       "POST",
       this.profilePath(
@@ -267,6 +393,15 @@ class BackendClient {
   }
 
   async getDhaDetails(personalIdNumber: string): Promise<DhaDetailsResponse> {
+    if (this.useMockBackend) {
+      return {
+        hasPhoto: true,
+        dateOfBirth: "1990-01-01",
+        isSouthAfricanCitizen: true,
+        personalIdNumber,
+      };
+    }
+
     return await this.requestJson(
       "GET",
       this.relyPath(
@@ -277,13 +412,23 @@ class BackendClient {
     );
   }
 
-  async classifyBusinessIndustry(description: string): Promise<string | undefined> {
+  async classifyBusinessIndustry(
+    description: string,
+  ): Promise<string | undefined> {
+    if (this.useMockBackend) {
+      return "5999";
+    }
+
     const url =
       config.MCC_CLASSIFIER_URL ??
       this.onboardingPath("/api/classify-business-industry");
-    const result = await this.requestJson<Record<string, unknown>>("POST", url, {
-      description,
-    });
+    const result = await this.requestJson<Record<string, unknown>>(
+      "POST",
+      url,
+      {
+        description,
+      },
+    );
     return String(result?.mccCode ?? result?.code ?? "") || undefined;
   }
 
@@ -292,12 +437,20 @@ class BackendClient {
     event: string,
     meta: Record<string, unknown> = {},
   ): Promise<void> {
+    if (this.useMockBackend) {
+      return;
+    }
+
     const path = this.hsproxyPath(
       `/hsproxy/applications/application-id/${encodeURIComponent(
         applicationId,
       )}/ui-flow-events/publish`,
     );
-    await this.requestJson("POST", path, { event, meta, source: "whatsapp_poc" });
+    await this.requestJson("POST", path, {
+      event,
+      meta,
+      source: "whatsapp_poc",
+    });
   }
 
   private onboardingPath(path: string): string {
@@ -356,6 +509,31 @@ class BackendClient {
     }
 
     return {} as T;
+  }
+
+  private getMockApplication(
+    merchantId: string,
+  ): MockBackendApplication | undefined {
+    this.logMockModeOnce();
+    return BackendClient.mockApplications.get(merchantId);
+  }
+
+  private setMockApplication(
+    merchantId: string,
+    app: MockBackendApplication,
+  ): void {
+    this.logMockModeOnce();
+    BackendClient.mockApplications.set(merchantId, app);
+  }
+
+  private logMockModeOnce(): void {
+    if (BackendClient.mockModeLogged) {
+      return;
+    }
+    BackendClient.mockModeLogged = true;
+    logger.warn(
+      "MOCK_BACKEND enabled; using in-memory onboarding API responses",
+    );
   }
 }
 
@@ -465,7 +643,8 @@ function extractDateFromSouthAfricanId(idNumber: string): string | undefined {
     String(new Date().getUTCFullYear()).slice(-2),
   );
   const futureToleranceYears = 10;
-  const century = yy <= currentTwoDigitYear + futureToleranceYears ? 2000 : 1900;
+  const century =
+    yy <= currentTwoDigitYear + futureToleranceYears ? 2000 : 1900;
   const year = century + yy;
 
   const date = new Date(Date.UTC(year, mm - 1, dd));
@@ -476,26 +655,337 @@ function extractDateFromSouthAfricanId(idNumber: string): string | undefined {
   return date.toISOString().slice(0, 10);
 }
 
+function normalizeDateToIso(value: string | undefined): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const raw = value.trim();
+  if (!raw) {
+    return undefined;
+  }
+
+  // Already ISO-like (YYYY-MM-DD)
+  const isoMatch = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (isoMatch) {
+    const year = Number(isoMatch[1]);
+    const month = Number(isoMatch[2]);
+    const day = Number(isoMatch[3]);
+    const date = new Date(Date.UTC(year, month - 1, day));
+    if (
+      !Number.isNaN(date.getTime()) &&
+      date.getUTCFullYear() === year &&
+      date.getUTCMonth() + 1 === month &&
+      date.getUTCDate() === day
+    ) {
+      return date.toISOString().slice(0, 10);
+    }
+  }
+
+  // Compact format YYYYMMDD
+  const compactIso = raw.match(/^(\d{4})(\d{2})(\d{2})$/);
+  if (compactIso) {
+    return normalizeDateToIso(
+      `${compactIso[1]}-${compactIso[2]}-${compactIso[3]}`,
+    );
+  }
+
+  // Slash/dot format: DD/MM/YYYY or MM/DD/YYYY (default to DD/MM for ZA context)
+  const slash = raw.match(/^(\d{1,2})[\/.](\d{1,2})[\/.](\d{4})$/);
+  if (slash) {
+    const a = Number(slash[1]);
+    const b = Number(slash[2]);
+    const year = Number(slash[3]);
+
+    const asDayMonth = normalizeDateToIso(
+      `${year}-${String(b).padStart(2, "0")}-${String(a).padStart(2, "0")}`,
+    );
+    const asMonthDay = normalizeDateToIso(
+      `${year}-${String(a).padStart(2, "0")}-${String(b).padStart(2, "0")}`,
+    );
+
+    if (asDayMonth && !asMonthDay) return asDayMonth;
+    if (!asDayMonth && asMonthDay) return asMonthDay;
+    if (asDayMonth && asMonthDay) return asDayMonth;
+  }
+
+  return undefined;
+}
+
 function normalizeBankName(raw: string | undefined): string | undefined {
   if (!raw) {
     return undefined;
   }
 
-  const direct = SUPPORTED_BANKS.find(
-    (item) => item.toLowerCase() === raw.toLowerCase(),
-  );
+  const lowered = raw.toLowerCase().trim();
+  const normalized = lowered.replace(/[^a-z0-9]+/g, " ").trim();
+  const compact = normalized.replace(/\s+/g, "");
+
+  const direct = SUPPORTED_BANKS.find((item) => {
+    const candidate = item.toLowerCase();
+    return candidate === lowered || candidate === normalized;
+  });
   if (direct) {
     return direct;
   }
 
-  return SUPPORTED_BANKS.find((item) =>
-    raw.toLowerCase().includes(item.toLowerCase()),
+  for (const entry of BANK_ALIASES) {
+    const alias = entry.alias.toLowerCase();
+    const aliasNormalized = alias.replace(/[^a-z0-9]+/g, " ").trim();
+    const aliasCompact = aliasNormalized.replace(/\s+/g, "");
+    if (
+      lowered.includes(alias) ||
+      normalized.includes(aliasNormalized) ||
+      compact.includes(aliasCompact)
+    ) {
+      return entry.bank;
+    }
+  }
+
+  return SUPPORTED_BANKS.find((item) => {
+    const candidate = item.toLowerCase();
+    const candidateNormalized = candidate.replace(/[^a-z0-9]+/g, " ").trim();
+    const candidateCompact = candidateNormalized.replace(/\s+/g, "");
+    return (
+      lowered.includes(candidate) ||
+      normalized.includes(candidateNormalized) ||
+      compact.includes(candidateCompact)
+    );
+  });
+}
+
+function normalizeAccountNumber(raw: string | undefined): string | undefined {
+  if (!raw) {
+    return undefined;
+  }
+
+  const digits = raw.replace(/\D/g, "");
+  if (digits.length < 6 || digits.length > 16) {
+    return undefined;
+  }
+  return digits;
+}
+
+function parseManualBankText(text: string): {
+  bankName?: string;
+  bankAccountNumber?: string;
+  bankAccountHolderName?: string;
+} {
+  const parts = text
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  if (parts.length >= 2) {
+    return {
+      bankName: parts[0],
+      bankAccountNumber: normalizeAccountNumber(parts[1]),
+      bankAccountHolderName: parts.slice(2).join(", ") || undefined,
+    };
+  }
+
+  const accountMatch = text.match(
+    /(?:account\s*(?:number|no\.?|#)?\s*[:\-]?\s*)([\d\s-]{6,24})/i,
   );
+  const holderMatch = text.match(
+    /(?:account\s*holder|name)\s*[:\-]?\s*([A-Za-z\s'`.-]{3,80})/i,
+  );
+
+  return {
+    bankName: normalizeBankName(text) ?? undefined,
+    bankAccountNumber: normalizeAccountNumber(accountMatch?.[1]),
+    bankAccountHolderName: holderMatch?.[1]?.trim(),
+  };
 }
 
 async function safeReadMediaFile(mediaPath?: string): Promise<string> {
-  void mediaPath;
-  return "";
+  if (!mediaPath) {
+    return "";
+  }
+
+  const extension = path.extname(mediaPath).toLowerCase();
+  if (extension === ".pdf") {
+    try {
+      const buffer = await fs.readFile(mediaPath);
+      const parser = new PDFParse({ data: buffer });
+      const parsed = await parser.getText();
+      await parser.destroy();
+      return String(parsed.text ?? "").trim();
+    } catch (error) {
+      logger.warn({ err: error }, "PDF text extraction failed");
+      return "";
+    }
+  }
+
+  const textLike = new Set([".txt", ".csv", ".json", ".md", ".xml"]);
+
+  if (!textLike.has(extension)) {
+    return "";
+  }
+
+  try {
+    return await fs.readFile(mediaPath, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+async function runOpenAiTextOcr(
+  request: OcrExtractRequest,
+  sourceText: string,
+): Promise<Partial<OcrExtractResponse> | null> {
+  if (!config.OPENAI_API_KEY || !sourceText.trim()) {
+    return null;
+  }
+
+  try {
+    const prompt =
+      request.documentType === "SA_ID"
+        ? "Extract SA ID info from the supplied text. Return strict JSON with keys: principalFirstName (string|null), principalLastName (string|null), principalIdNumber (string|null), userDateOfBirth (YYYY-MM-DD|null), isSouthAfricanCitizen (boolean|null), documentKind ('sa_id'|'passport'|'unknown'), confidence (0..1)."
+        : "Extract bank proof info from the supplied text. Return strict JSON with keys: bankName (string|null), bankAccountNumber (string|null), bankAccountHolderName (string|null), confidence (0..1).";
+
+    const response = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        model: "gpt-4o-mini",
+        temperature: 0,
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are an OCR extraction service. Output only valid JSON.",
+          },
+          {
+            role: "user",
+            content: `${prompt}\n\nDocument text:\n${sourceText}`,
+          },
+        ],
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${config.OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        timeout: config.REQUEST_TIMEOUT_MS,
+      },
+    );
+
+    const raw = String(response.data?.choices?.[0]?.message?.content ?? "");
+    const parsed = extractJsonObject(raw);
+    if (!parsed) {
+      return null;
+    }
+
+    return parsed as Partial<OcrExtractResponse>;
+  } catch (error) {
+    logger.warn(
+      { err: error },
+      "OpenAI text OCR failed; falling back to heuristic parsing",
+    );
+    return null;
+  }
+}
+
+function mediaPathToMimeType(mediaPath: string): string {
+  const extension = path.extname(mediaPath).toLowerCase();
+  switch (extension) {
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".png":
+      return "image/png";
+    case ".webp":
+      return "image/webp";
+    case ".gif":
+      return "image/gif";
+    case ".bmp":
+      return "image/bmp";
+    default:
+      return "application/octet-stream";
+  }
+}
+
+function extractJsonObject(text: string): Record<string, unknown> | null {
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start < 0 || end <= start) {
+    return null;
+  }
+
+  const candidate = text.slice(start, end + 1);
+  try {
+    return JSON.parse(candidate) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+async function runOpenAiMediaOcr(
+  request: OcrExtractRequest,
+): Promise<Partial<OcrExtractResponse> | null> {
+  if (!config.OPENAI_API_KEY || !request.mediaPath) {
+    return null;
+  }
+
+  const mimeType = mediaPathToMimeType(request.mediaPath);
+  if (!mimeType.startsWith("image/")) {
+    return null;
+  }
+
+  try {
+    const imageBuffer = await fs.readFile(request.mediaPath);
+    const dataUrl = `data:${mimeType};base64,${imageBuffer.toString("base64")}`;
+
+    const prompt =
+      request.documentType === "SA_ID"
+        ? "Extract SA ID info. Return strict JSON with keys: principalFirstName (string|null), principalLastName (string|null), principalIdNumber (string|null), userDateOfBirth (YYYY-MM-DD|null), isSouthAfricanCitizen (boolean|null), documentKind ('sa_id'|'passport'|'unknown'), confidence (0..1)."
+        : "Extract bank proof info. Return strict JSON with keys: bankName (string|null), bankAccountNumber (string|null), bankAccountHolderName (string|null), confidence (0..1).";
+
+    const response = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        model: "gpt-4o-mini",
+        temperature: 0,
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are an OCR extraction service. Output only valid JSON.",
+          },
+          {
+            role: "user",
+            content: [
+              { type: "text", text: prompt },
+              { type: "image_url", image_url: { url: dataUrl } },
+            ],
+          },
+        ],
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${config.OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        timeout: config.REQUEST_TIMEOUT_MS,
+      },
+    );
+
+    const raw = String(response.data?.choices?.[0]?.message?.content ?? "");
+    const parsed = extractJsonObject(raw);
+    if (!parsed) {
+      return null;
+    }
+
+    return parsed as Partial<OcrExtractResponse>;
+  } catch (error) {
+    logger.warn(
+      { err: error },
+      "OpenAI media OCR failed; falling back to heuristic parsing",
+    );
+    return null;
+  }
 }
 
 function hydrateStateFromFields(
@@ -504,15 +994,25 @@ function hydrateStateFromFields(
 ): OnboardingState {
   return {
     ...state,
-    businessName: String(fields.BUSINESS_REGISTERED_NAME ?? state.businessName ?? ""),
+    businessName: String(
+      fields.BUSINESS_REGISTERED_NAME ?? state.businessName ?? "",
+    ),
     businessDescription: String(
       fields.BUSINESS_DESCRIPTION ?? state.businessDescription ?? "",
     ),
     mccCode: String(fields.BUSINESS_MCC_CODE ?? state.mccCode ?? ""),
+    principalFirstName: String(
+      fields.PRINCIPAL_FIRST_NAME ?? state.principalFirstName ?? "",
+    ),
+    principalLastName: String(
+      fields.PRINCIPAL_LAST_NAME ?? state.principalLastName ?? "",
+    ),
     principalIdNumber: String(
       fields.PRINCIPAL_ID_NUMBER ?? state.principalIdNumber ?? "",
     ),
-    userDateOfBirth: String(fields.USER_DATE_OF_BIRTH ?? state.userDateOfBirth ?? ""),
+    userDateOfBirth: String(
+      fields.USER_DATE_OF_BIRTH ?? state.userDateOfBirth ?? "",
+    ),
     bankName: String(fields.BANK_NAME ?? state.bankName ?? ""),
     bankAccountNumber: String(
       fields.BANK_ACCOUNT_NUMBER ?? state.bankAccountNumber ?? "",
@@ -530,48 +1030,112 @@ export async function runOcrExtract(
   const fileText = await safeReadMediaFile(request.mediaPath);
   const source = `${inlineText}\n${fileText}`.trim();
   const lower = source.toLowerCase();
+  const aiTextOcr = await runOpenAiTextOcr(request, source);
+  const aiMediaOcr = await runOpenAiMediaOcr(request);
+  const aiOcr = {
+    ...(aiTextOcr ?? {}),
+    ...(aiMediaOcr ?? {}),
+  } as Partial<OcrExtractResponse>;
 
   if (request.documentType === "SA_ID") {
+    const heuristicSurname = source
+      .match(/surname\s*[:\-]?\s*([A-Z][A-Z\s'-]{1,60})/i)?.[1]
+      ?.trim();
+    const heuristicNames = source
+      .match(/(?:names|given\s*names?)\s*[:\-]?\s*([A-Z][A-Z\s'-]{1,80})/i)?.[1]
+      ?.trim();
+    const aiFirstName =
+      typeof aiOcr?.principalFirstName === "string" &&
+      aiOcr.principalFirstName.trim()
+        ? aiOcr.principalFirstName.trim()
+        : undefined;
+    const aiLastName =
+      typeof aiOcr?.principalLastName === "string" &&
+      aiOcr.principalLastName.trim()
+        ? aiOcr.principalLastName.trim()
+        : undefined;
+    const principalFirstName = aiFirstName ?? heuristicNames;
+    const principalLastName = aiLastName ?? heuristicSurname;
+
     const idMatch = source.match(/\b\d{13}\b/);
-    const dob = idMatch ? extractDateFromSouthAfricanId(idMatch[0]) : undefined;
+    const primaryId =
+      aiOcr?.principalIdNumber && aiOcr.principalIdNumber.length === 13
+        ? aiOcr.principalIdNumber
+        : idMatch?.[0];
+    const idDob = primaryId
+      ? extractDateFromSouthAfricanId(primaryId)
+      : undefined;
+    const ocrDob = normalizeDateToIso(aiOcr?.userDateOfBirth);
+    const dob = idDob && ocrDob && idDob !== ocrDob ? idDob : (ocrDob ?? idDob);
     const isPassport =
+      aiOcr?.documentKind === "passport" ||
       lower.includes("passport") ||
       lower.includes("foreign") ||
       lower.includes("non-sa");
-    const isSouthAfricanCitizen = !isPassport;
+    const isSouthAfricanCitizen = aiOcr?.isSouthAfricanCitizen ?? !isPassport;
 
     let confidence = 0.2;
-    if (idMatch) {
+    if (primaryId) {
       confidence = 0.85;
     }
+    if (typeof aiOcr?.confidence === "number") {
+      confidence = aiOcr.confidence;
+    }
     if (!source) {
-      confidence = 0.1;
+      confidence = Math.max(confidence, aiOcr?.confidence ?? 0.1);
     }
 
     return {
       documentType: "SA_ID",
       confidence,
-      documentKind: isPassport ? "passport" : idMatch ? "sa_id" : "unknown",
+      documentKind: isPassport ? "passport" : primaryId ? "sa_id" : "unknown",
       isSouthAfricanCitizen,
-      principalIdNumber: idMatch?.[0],
+      principalIdNumber: primaryId,
+      principalFirstName,
+      principalLastName,
       userDateOfBirth: dob,
     };
   }
 
+  const labelledAccountMatch = source.match(
+    /(?:account\s*(?:number|no\.?|#)?\s*[:\-]?\s*)([\d\s-]{6,24})/i,
+  );
   const accountNumberMatch = source.match(/\b\d{6,16}\b/);
-  const bankName = normalizeBankName(source);
+  const manualBank = parseManualBankText(source);
+  const bankName =
+    normalizeBankName(aiOcr?.bankName) ??
+    normalizeBankName(manualBank.bankName) ??
+    normalizeBankName(source);
   const accountHolderMatch = source.match(
     /account\s*holder[:\-]?\s*([A-Za-z\s]{3,60})/i,
   );
+  const bankAccountNumber =
+    normalizeAccountNumber(aiOcr?.bankAccountNumber) ??
+    normalizeAccountNumber(labelledAccountMatch?.[1]) ??
+    normalizeAccountNumber(accountNumberMatch?.[0]);
+  const bankAccountHolderName =
+    typeof aiOcr?.bankAccountHolderName === "string" &&
+    aiOcr.bankAccountHolderName.trim()
+      ? aiOcr.bankAccountHolderName.trim()
+      : accountHolderMatch?.[1]?.trim();
 
   let confidence = 0.2;
-  if (accountNumberMatch && bankName) {
+  if (bankAccountNumber && bankName) {
     confidence = 0.85;
-  } else if (accountNumberMatch || bankName) {
+  } else if (bankAccountNumber || bankName) {
     confidence = 0.55;
   }
+  if (typeof aiOcr?.confidence === "number") {
+    confidence = aiOcr.confidence;
+  }
+
+  // Keep confidence aligned with extracted mandatory fields to reduce false negatives.
+  if (bankAccountNumber && bankName) {
+    confidence = Math.max(confidence, 0.8);
+  }
+
   if (!source) {
-    confidence = 0.1;
+    confidence = Math.max(confidence, aiOcr?.confidence ?? 0.1);
   }
 
   return {
@@ -579,8 +1143,8 @@ export async function runOcrExtract(
     confidence,
     documentKind: "bank_document",
     bankName,
-    bankAccountNumber: accountNumberMatch?.[0],
-    bankAccountHolderName: accountHolderMatch?.[1]?.trim(),
+    bankAccountNumber,
+    bankAccountHolderName,
   };
 }
 
@@ -612,10 +1176,16 @@ async function persistFields(
   fields: Record<string, unknown>,
 ): Promise<void> {
   if (!state.merchantId || !state.applicationId) {
-    throw new Error("Cannot persist fields without merchant and application context");
+    throw new Error(
+      "Cannot persist fields without merchant and application context",
+    );
   }
 
-  await backendClient.updateApplication(state.merchantId, state.applicationId, fields);
+  await backendClient.updateApplication(
+    state.merchantId,
+    state.applicationId,
+    fields,
+  );
 }
 
 function userText(payload: NormalizedIncomingMessage): string {
@@ -660,34 +1230,53 @@ async function runEditFlow(
     if (state.editField === "BUSINESS_REGISTERED_NAME") {
       nextState.businessName = text;
       await persistFields(nextState, { BUSINESS_REGISTERED_NAME: text });
-      return { state: nextState, reply: "Updated your business name. Let’s continue." };
+      return {
+        state: nextState,
+        reply: "Updated your business name. Let’s continue.",
+      };
     }
 
     if (state.editField === "ADDRESS") {
       const address = parseAddress(text);
       nextState.businessAddress = address;
-      await persistFields(nextState, buildAddressFieldPayload("ADDRESS", address));
-      return { state: nextState, reply: "Updated your business address. Let’s continue." };
+      await persistFields(
+        nextState,
+        buildAddressFieldPayload("ADDRESS", address),
+      );
+      return {
+        state: nextState,
+        reply: "Updated your business address. Let’s continue.",
+      };
     }
 
     if (state.editField === "USER_ADDRESS") {
       const address = parseAddress(text);
       nextState.residentialAddress = address;
-      await persistFields(nextState, buildAddressFieldPayload("USER_ADDRESS", address));
+      await persistFields(
+        nextState,
+        buildAddressFieldPayload("USER_ADDRESS", address),
+      );
       return {
         state: nextState,
         reply: "Updated your residential address. Let’s continue.",
       };
     }
 
-    if (state.editField === "BANK" || state.editField === "BANK_ACCOUNT_HOLDER_NAME") {
-      const bankOcr = await runOcrExtract({ documentType: "BANK_DOCUMENT", text });
+    if (
+      state.editField === "BANK" ||
+      state.editField === "BANK_ACCOUNT_HOLDER_NAME"
+    ) {
+      const bankOcr = await runOcrExtract({
+        documentType: "BANK_DOCUMENT",
+        text,
+      });
       nextState.bankName = bankOcr.bankName ?? state.bankName;
-      nextState.bankAccountNumber = bankOcr.bankAccountNumber ?? state.bankAccountNumber;
+      nextState.bankAccountNumber =
+        bankOcr.bankAccountNumber ?? state.bankAccountNumber;
       nextState.bankAccountHolderName =
         state.editField === "BANK_ACCOUNT_HOLDER_NAME"
           ? text
-          : bankOcr.bankAccountHolderName ?? state.bankAccountHolderName;
+          : (bankOcr.bankAccountHolderName ?? state.bankAccountHolderName);
 
       await persistFields(nextState, {
         BANK_NAME: nextState.bankName,
@@ -696,7 +1285,10 @@ async function runEditFlow(
         BANK_ACCOUNT_TYPE: "CURRENT",
       });
 
-      return { state: nextState, reply: "Updated your banking details. Let’s continue." };
+      return {
+        state: nextState,
+        reply: "Updated your banking details. Let’s continue.",
+      };
     }
 
     return { state: nextState, reply: "Updated. Let’s continue." };
@@ -724,14 +1316,19 @@ async function ensureEntryState(
   try {
     inProgress = await backendClient.findInProgressApplication(merchantId);
   } catch (error) {
-    logger.warn({ error }, "Resume lookup failed; continuing with new application flow");
+    logger.warn(
+      { err: error },
+      "Resume lookup failed; continuing with new application flow",
+    );
   }
 
   if (inProgress?.applicationId) {
     nextState = {
       ...hydrateStateFromFields(nextState, inProgress.fields ?? {}),
       applicationId: inProgress.applicationId,
-      step: inferStepFromApplicationFields(inProgress.fields ?? {}) ?? "BUSINESS_NAME",
+      step:
+        inferStepFromApplicationFields(inProgress.fields ?? {}) ??
+        "BUSINESS_NAME",
     };
     return nextState;
   }
@@ -752,7 +1349,9 @@ function inferStepFromApplicationFields(
 ): OnboardingStep | undefined {
   const hasBusinessName = Boolean(fields.BUSINESS_REGISTERED_NAME);
   const hasPrincipalId = Boolean(fields.PRINCIPAL_ID_NUMBER);
-  const hasResidential = Boolean(fields.USER_ADDRESS_STREET1 || fields.USER_ADDRESS_CITY);
+  const hasResidential = Boolean(
+    fields.USER_ADDRESS_STREET1 || fields.USER_ADDRESS_CITY,
+  );
   const hasBank = Boolean(fields.BANK_ACCOUNT_NUMBER && fields.BANK_NAME);
   const hasSelfie = Boolean(fields.DOCUMENT_SELFIE_RESOURCE_URI);
 
@@ -776,20 +1375,25 @@ async function handleHelpFlow(
 
   if (state.helpActive) {
     if (normalized === "1" || normalized.includes("continue")) {
-      return { state: { ...state, helpActive: false }, reply: "Great, let’s continue onboarding." };
+      return {
+        state: { ...state, helpActive: false },
+        reply: "Great, let’s continue onboarding.",
+      };
     }
 
     if (normalized === "2" || normalized.includes("change")) {
       return {
         state: { ...state, helpActive: false },
-        reply: "What would you like to change? (business name, business address, residential address, bank)",
+        reply:
+          "What would you like to change? (business name, business address, residential address, bank)",
       };
     }
 
     if (normalized === "3" || normalized.includes("support")) {
       return {
         state: { ...state, helpActive: false },
-        reply: "A support consultant will contact you shortly. You can still continue onboarding here anytime.",
+        reply:
+          "A support consultant will contact you shortly. You can still continue onboarding here anytime.",
       };
     }
 
@@ -814,12 +1418,16 @@ export async function processOnboardingMessage(
 
   if (state.applicationId) {
     try {
-      await backendClient.publishFlowEvent(state.applicationId, "message_received", {
-        step: state.step,
-        messageType: payload.type,
-      });
+      await backendClient.publishFlowEvent(
+        state.applicationId,
+        "message_received",
+        {
+          step: state.step,
+          messageType: payload.type,
+        },
+      );
     } catch (error) {
-      logger.warn({ error }, "Failed to publish funnel event");
+      logger.warn({ err: error }, "Failed to publish funnel event");
     }
   }
 
@@ -859,7 +1467,8 @@ export async function processOnboardingMessage(
 
   if (state.step === "TERMINAL") {
     return {
-      replyText: state.lastPrompt ?? "This onboarding session is closed for now.",
+      replyText:
+        state.lastPrompt ?? "This onboarding session is closed for now.",
       state,
     };
   }
@@ -888,7 +1497,9 @@ export async function processOnboardingMessage(
     const nextState: OnboardingState = {
       ...state,
       businessName: text,
-      step: state.isAIpoweredMccEnabled ? "BUSINESS_DESCRIPTION" : "BUSINESS_ADDRESS",
+      step: state.isAIpoweredMccEnabled
+        ? "BUSINESS_DESCRIPTION"
+        : "BUSINESS_ADDRESS",
     };
 
     await persistFields(nextState, { BUSINESS_REGISTERED_NAME: text });
@@ -943,7 +1554,8 @@ export async function processOnboardingMessage(
       ...(nextState.mccCode ? { BUSINESS_MCC_CODE: nextState.mccCode } : {}),
     });
 
-    const reply = "Please upload your South African ID document (image or PDF).";
+    const reply =
+      "Please upload your South African ID document (image or PDF).";
     return { replyText: reply, state: { ...nextState, lastPrompt: reply } };
   }
 
@@ -960,7 +1572,10 @@ export async function processOnboardingMessage(
       text,
     });
 
-    if (ocr.documentKind === "passport" || ocr.isSouthAfricanCitizen === false) {
+    if (
+      ocr.documentKind === "passport" ||
+      ocr.isSouthAfricanCitizen === false
+    ) {
       const outcome = terminal(
         state,
         "NON_SA_CITIZEN",
@@ -985,7 +1600,9 @@ export async function processOnboardingMessage(
     }
 
     const idNumber = ocr.principalIdNumber;
-    let dob = ocr.userDateOfBirth ?? extractDateFromSouthAfricanId(idNumber);
+    const idDob = extractDateFromSouthAfricanId(idNumber);
+    const ocrDob = normalizeDateToIso(ocr.userDateOfBirth);
+    let dob = idDob && ocrDob && idDob !== ocrDob ? idDob : (ocrDob ?? idDob);
     let dhaHasPhoto = false;
     let isSouthAfricanCitizen: boolean = ocr.isSouthAfricanCitizen ?? true;
 
@@ -995,13 +1612,26 @@ export async function processOnboardingMessage(
         dhaHasPhoto = dha.hasPhoto;
       }
       if (typeof dha?.dateOfBirth === "string" && dha.dateOfBirth) {
-        dob = dha.dateOfBirth;
+        const dhaDob = normalizeDateToIso(dha.dateOfBirth);
+        if (dhaDob) {
+          if (idDob && dhaDob !== idDob) {
+            logger.warn(
+              { idDob, dhaDob },
+              "DHA DOB differs from SA ID-derived DOB; keeping ID-derived value",
+            );
+          } else {
+            dob = dhaDob;
+          }
+        }
       }
       if (typeof dha?.isSouthAfricanCitizen === "boolean") {
         isSouthAfricanCitizen = dha.isSouthAfricanCitizen;
       }
     } catch (error) {
-      logger.warn({ error }, "DHA lookup failed; continuing with OCR data");
+      logger.warn(
+        { err: error },
+        "DHA lookup failed; continuing with OCR data",
+      );
     }
 
     if (!isSouthAfricanCitizen) {
@@ -1053,6 +1683,8 @@ export async function processOnboardingMessage(
     const nextState: OnboardingState = {
       ...state,
       principalIdNumber: idNumber,
+      principalFirstName: ocr.principalFirstName,
+      principalLastName: ocr.principalLastName,
       userDateOfBirth: dob,
       userIsSouthAfricanCitizen: true,
       dhaHasPhoto,
@@ -1062,6 +1694,12 @@ export async function processOnboardingMessage(
 
     await persistFields(nextState, {
       PRINCIPAL_ID_NUMBER: idNumber,
+      ...(ocr.principalFirstName
+        ? { PRINCIPAL_FIRST_NAME: ocr.principalFirstName }
+        : {}),
+      ...(ocr.principalLastName
+        ? { PRINCIPAL_LAST_NAME: ocr.principalLastName }
+        : {}),
       USER_IS_SOUTH_AFRICAN_CITIZEN: true,
       USER_DATE_OF_BIRTH: dob,
     });
@@ -1069,7 +1707,13 @@ export async function processOnboardingMessage(
     const pathNote = dhaHasPhoto
       ? "DHA photo found, so selfie handoff later will be enough."
       : "DHA photo missing; we will rely on your uploaded ID plus selfie handoff.";
-    const reply = `I extracted:\n- ID number: ${maskSensitive(idNumber)}\n- Date of birth: ${dob}\n${pathNote}\nReply YES to confirm or NO to retry.`;
+    const nameLine =
+      nextState.principalFirstName || nextState.principalLastName
+        ? `- Name: ${[nextState.principalFirstName, nextState.principalLastName]
+            .filter(Boolean)
+            .join(" ")}\n`
+        : "";
+    const reply = `I extracted:\n${nameLine}- ID number: ${maskSensitive(idNumber)}\n- Date of birth: ${dob}\n${pathNote}\nReply YES to confirm or NO to retry.`;
     return { replyText: reply, state: { ...nextState, lastPrompt: reply } };
   }
 
@@ -1105,9 +1749,13 @@ export async function processOnboardingMessage(
       step: "BANK_DOCUMENT",
     };
 
-    await persistFields(nextState, buildAddressFieldPayload("USER_ADDRESS", residentialAddress));
+    await persistFields(
+      nextState,
+      buildAddressFieldPayload("USER_ADDRESS", residentialAddress),
+    );
 
-    const reply = "Please upload your proof of banking (statement or bank letter).";
+    const reply =
+      "Please upload your proof of banking (statement or bank letter).";
     return { replyText: reply, state: { ...nextState, lastPrompt: reply } };
   }
 
@@ -1124,71 +1772,307 @@ export async function processOnboardingMessage(
       text,
     });
 
-    const bankName = normalizeBankName(ocr.bankName);
+    const manualSource = [
+      text,
+      ocr.bankName,
+      ocr.bankAccountNumber,
+      ocr.bankAccountHolderName,
+    ]
+      .filter(Boolean)
+      .join(", ");
+    const manual = parseManualBankText(manualSource);
 
-    if (!bankName || !ocr.bankAccountNumber || ocr.confidence < 0.5) {
-      const retries = (state.bankDocRetries ?? 0) + 1;
-      if (retries > config.OCR_RETRY_LIMIT) {
-        const reply =
-          "I’m still struggling to read your bank document. Please type: BANK NAME, ACCOUNT NUMBER, ACCOUNT HOLDER.";
-        return {
-          replyText: reply,
-          state: {
-            ...state,
-            bankDocRetries: retries,
-            lastPrompt: reply,
-          },
-        };
-      }
+    const bankName =
+      normalizeBankName(ocr.bankName) ?? normalizeBankName(manual.bankName);
+    const bankAccountNumber =
+      normalizeAccountNumber(ocr.bankAccountNumber) ??
+      normalizeAccountNumber(manual.bankAccountNumber);
+    const inferredHolderName = [
+      state.principalFirstName,
+      state.principalLastName,
+    ]
+      .filter(Boolean)
+      .join(" ");
+    const bankAccountHolderName =
+      ocr.bankAccountHolderName ??
+      manual.bankAccountHolderName ??
+      (inferredHolderName || undefined);
+
+    logger.info(
+      {
+        mediaPath: payload.mediaPath,
+        ocr: {
+          confidence: ocr.confidence,
+          bankName: ocr.bankName,
+          bankAccountNumberMasked: maskSensitive(ocr.bankAccountNumber),
+          bankAccountHolderName: ocr.bankAccountHolderName,
+        },
+        manual: {
+          bankName: manual.bankName,
+          bankAccountNumberMasked: maskSensitive(manual.bankAccountNumber),
+          bankAccountHolderName: manual.bankAccountHolderName,
+        },
+        resolved: {
+          bankName,
+          bankAccountNumberMasked: maskSensitive(bankAccountNumber),
+          bankAccountHolderName,
+        },
+      },
+      "Bank notification letter parsed",
+    );
+
+    if (!bankAccountNumber) {
+      const resolvedBankName = bankName ?? state.bankName ?? undefined;
+      const resolvedAccountHolder =
+        bankAccountHolderName ?? state.bankAccountHolderName ?? undefined;
+      const nextState: OnboardingState = {
+        ...state,
+        bankName: resolvedBankName,
+        bankAccountHolderName: resolvedAccountHolder,
+        pendingBankNeedsAccountHolder: !resolvedAccountHolder,
+        bankDocRetries: (state.bankDocRetries ?? 0) + 1,
+        step: "BANK_ACCOUNT_NUMBER",
+      };
+
+      await persistFields(nextState, {
+        ...(resolvedBankName ? { BANK_NAME: resolvedBankName } : {}),
+        ...(resolvedAccountHolder
+          ? { BANK_ACCOUNT_HOLDER_NAME: resolvedAccountHolder }
+          : {}),
+      });
 
       const reply =
-        "I couldn't read the bank document clearly. Please re-upload a clearer statement or bank letter.";
+        "I could not read the account number clearly. Please type the account number.";
+      logger.info(
+        {
+          mediaPath: payload.mediaPath,
+          bankName: resolvedBankName,
+          bankAccountHolderName: resolvedAccountHolder,
+          retry: nextState.bankDocRetries,
+        },
+        "Bank notification letter missing account number; prompting manual entry",
+      );
       return {
         replyText: reply,
         state: {
-          ...state,
-          bankDocRetries: retries,
+          ...nextState,
           lastPrompt: reply,
         },
       };
     }
 
-    const needsAccountHolder = !ocr.bankAccountHolderName;
+    const effectiveConfidence = Math.max(ocr.confidence, 0.8);
+
+    const resolvedBankName = bankName ?? state.bankName ?? undefined;
+    const needsBankName = !resolvedBankName;
+    const needsAccountHolder = !bankAccountHolderName;
+    logger.info(
+      {
+        mediaPath: payload.mediaPath,
+        bankName: resolvedBankName,
+        bankAccountNumberMasked: maskSensitive(bankAccountNumber),
+        bankAccountHolderName,
+        needsBankName,
+        needsAccountHolder,
+      },
+      "Bank notification letter extraction routed",
+    );
     const nextState: OnboardingState = {
       ...state,
-      bankName,
-      bankAccountNumber: ocr.bankAccountNumber,
-      bankAccountHolderName: ocr.bankAccountHolderName,
-      pendingBankNeedsAccountHolder: needsAccountHolder,
+      bankName: resolvedBankName,
+      bankAccountNumber,
+      bankAccountHolderName,
+      pendingBankNeedsAccountHolder: needsBankName || needsAccountHolder,
       bankDocRetries: 0,
-      step: needsAccountHolder ? "BANK_ACCOUNT_HOLDER" : "BANK_CONFIRM",
+      step: needsBankName
+        ? "BANK_NAME"
+        : needsAccountHolder
+          ? "BANK_ACCOUNT_HOLDER"
+          : "BANK_CONFIRM",
     };
 
     await persistFields(nextState, {
-      BANK_NAME: bankName,
-      BANK_ACCOUNT_NUMBER: ocr.bankAccountNumber,
+      ...(resolvedBankName ? { BANK_NAME: resolvedBankName } : {}),
+      BANK_ACCOUNT_NUMBER: bankAccountNumber,
       BANK_ACCOUNT_TYPE: "CURRENT",
-      ...(ocr.bankAccountHolderName
-        ? { BANK_ACCOUNT_HOLDER_NAME: ocr.bankAccountHolderName }
+      ...(bankAccountHolderName
+        ? { BANK_ACCOUNT_HOLDER_NAME: bankAccountHolderName }
         : {}),
     });
 
     if (nextState.merchantId) {
       await backendClient
         .saveBankAccount(nextState.merchantId, {
-          bankName,
-          accountNumber: ocr.bankAccountNumber,
+          ...(resolvedBankName ? { bankName: resolvedBankName } : {}),
+          accountNumber: bankAccountNumber,
           accountType: "CURRENT",
-          ...(ocr.bankAccountHolderName
-            ? { accountHolderName: ocr.bankAccountHolderName }
+          ...(bankAccountHolderName
+            ? { accountHolderName: bankAccountHolderName }
             : {}),
         })
         .catch((error) => {
-          logger.warn({ error }, "Failed to persist bank account on profile API");
+          logger.warn(
+            { err: error },
+            "Failed to persist bank account on profile API",
+          );
         });
     }
 
+    if (needsBankName) {
+      const reply =
+        "I could read the account number, but not the bank name. Please type the bank name.";
+      return {
+        replyText: reply,
+        state: {
+          ...nextState,
+          lastPrompt: reply,
+        },
+      };
+    }
+
     if (needsAccountHolder) {
+      const reply = "Please type the bank account holder name.";
+      return {
+        replyText: reply,
+        state: {
+          ...nextState,
+          lastPrompt: reply,
+        },
+      };
+    }
+
+    const reply = `I extracted:\n- Bank: ${nextState.bankName}\n- Account number: ${maskSensitive(nextState.bankAccountNumber)}\n- Account holder: ${nextState.bankAccountHolderName}\nReply YES to confirm or NO to retry.`;
+    return {
+      replyText: reply,
+      state: {
+        ...nextState,
+        lastPrompt: reply,
+      },
+    };
+  }
+
+  if (state.step === "BANK_ACCOUNT_NUMBER") {
+    if (!text) {
+      const reply = "Please type the bank account number to continue.";
+      return { replyText: reply, state: { ...state, lastPrompt: reply } };
+    }
+
+    const bankAccountNumber = normalizeAccountNumber(text);
+    if (!bankAccountNumber) {
+      const reply =
+        "That account number looks invalid. Please type digits only (6 to 16 numbers).";
+      return { replyText: reply, state: { ...state, lastPrompt: reply } };
+    }
+
+    const needsBankName = !state.bankName;
+    const needsAccountHolder = !state.bankAccountHolderName;
+    const nextState: OnboardingState = {
+      ...state,
+      bankAccountNumber,
+      pendingBankNeedsAccountHolder: needsAccountHolder,
+      step: needsBankName
+        ? "BANK_NAME"
+        : needsAccountHolder
+          ? "BANK_ACCOUNT_HOLDER"
+          : "BANK_CONFIRM",
+    };
+
+    await persistFields(nextState, {
+      BANK_ACCOUNT_NUMBER: bankAccountNumber,
+      BANK_ACCOUNT_TYPE: "CURRENT",
+      ...(state.bankName ? { BANK_NAME: state.bankName } : {}),
+      ...(state.bankAccountHolderName
+        ? { BANK_ACCOUNT_HOLDER_NAME: state.bankAccountHolderName }
+        : {}),
+    });
+
+    if (nextState.merchantId) {
+      await backendClient
+        .saveBankAccount(nextState.merchantId, {
+          ...(state.bankName ? { bankName: state.bankName } : {}),
+          accountNumber: bankAccountNumber,
+          accountType: "CURRENT",
+          ...(state.bankAccountHolderName
+            ? { accountHolderName: state.bankAccountHolderName }
+            : {}),
+        })
+        .catch((error) => {
+          logger.warn(
+            { err: error },
+            "Failed to persist bank account on profile API",
+          );
+        });
+    }
+
+    if (needsBankName) {
+      const reply = "Please type the bank name.";
+      return {
+        replyText: reply,
+        state: {
+          ...nextState,
+          lastPrompt: reply,
+        },
+      };
+    }
+
+    if (needsAccountHolder) {
+      const reply = "Please type the bank account holder name.";
+      return {
+        replyText: reply,
+        state: {
+          ...nextState,
+          lastPrompt: reply,
+        },
+      };
+    }
+
+    const reply = `I extracted:\n- Bank: ${nextState.bankName}\n- Account number: ${maskSensitive(nextState.bankAccountNumber)}\n- Account holder: ${nextState.bankAccountHolderName}\nReply YES to confirm or NO to retry.`;
+    return {
+      replyText: reply,
+      state: {
+        ...nextState,
+        lastPrompt: reply,
+      },
+    };
+  }
+
+  if (state.step === "BANK_NAME") {
+    if (!text) {
+      const reply = "Please type the bank name to continue.";
+      return { replyText: reply, state: { ...state, lastPrompt: reply } };
+    }
+
+    const bankName = normalizeBankName(text) ?? text.trim();
+    const nextState: OnboardingState = {
+      ...state,
+      bankName,
+      step: state.bankAccountHolderName
+        ? "BANK_CONFIRM"
+        : "BANK_ACCOUNT_HOLDER",
+      pendingBankNeedsAccountHolder: !state.bankAccountHolderName,
+    };
+
+    await persistFields(nextState, { BANK_NAME: bankName });
+
+    if (state.merchantId && state.bankAccountNumber) {
+      await backendClient
+        .saveBankAccount(state.merchantId, {
+          bankName,
+          accountNumber: state.bankAccountNumber,
+          accountType: "CURRENT",
+          ...(state.bankAccountHolderName
+            ? { accountHolderName: state.bankAccountHolderName }
+            : {}),
+        })
+        .catch((error) => {
+          logger.warn(
+            { err: error },
+            "Failed to persist bank account on profile API",
+          );
+        });
+    }
+
+    if (!state.bankAccountHolderName) {
       const reply = "Please type the bank account holder name.";
       return {
         replyText: reply,
@@ -1238,7 +2122,9 @@ export async function processOnboardingMessage(
 
   if (state.step === "BANK_CONFIRM") {
     const normalized = text.toLowerCase();
-    if (normalized !== "yes" && normalized !== "y") {
+    if (
+      !["yes", "y", "confirm", "confirmed", "ok", "okay"].includes(normalized)
+    ) {
       const reply = "No problem — please upload your proof of banking again.";
       return {
         replyText: reply,
@@ -1273,12 +2159,15 @@ export async function processOnboardingMessage(
         normalized.includes(item),
       )
     ) {
-      const reply = "Please reply DONE once you have completed the selfie step.";
+      const reply =
+        "Please reply DONE once you have completed the selfie step.";
       return { replyText: reply, state: { ...state, lastPrompt: reply } };
     }
 
     if (!state.merchantId || !state.applicationId) {
-      throw new Error("Missing merchant/application for selfie completion check");
+      throw new Error(
+        "Missing merchant/application for selfie completion check",
+      );
     }
 
     const snapshot = await backendClient
