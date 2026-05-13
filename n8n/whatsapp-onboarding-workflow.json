@@ -1,5 +1,5 @@
 {
-  "id": "whatsapp-onboarding-live-2",
+  "id": "whatsapp-onboarding-live-3",
   "name": "WhatsApp Onboarding Flow Live",
   "nodes": [
     {
@@ -13,66 +13,28 @@
       "name": "Webhook In",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2,
-      "position": [240, 300]
+      "position": [260, 300]
     },
     {
       "parameters": {
-        "jsCode": "const body = $json;\nconst text = (body.text || body.body || '').trim();\n\nreturn [{\n  json: {\n    messageId: body.messageId || body.id || '',\n    from: body.from || body.userId || '',\n    type: body.type || 'text',\n    text,\n    mediaPath: body.mediaPath || '',\n    languageHint: body.languageHint || '',\n    timestamp: body.timestamp || Date.now()\n  }\n}];"
+        "jsCode": "const body = $json || {};\nconst messageId = String(body.messageId || body.id || '');\nconst from = String(body.from || body.userId || '');\nconst text = String(body.text || body.body || '').trim();\nconst type = String(body.type || 'text');\nconst payload = {\n  messageId,\n  from,\n  type,\n  text,\n  mediaPath: body.mediaPath || undefined,\n  languageHint: body.languageHint || undefined,\n  timestamp: body.timestamp || Date.now()\n};\n\nif (!payload.messageId || !payload.from) {\n  return [{ json: { deduped: false, replyText: 'Invalid inbound payload', session: null } }];\n}\n\nconst sessionApi = 'http://session-api:4000';\n\nconst dedupeResp = await fetch(`${sessionApi}/dedupe/${encodeURIComponent(payload.messageId)}`, {\n  method: 'POST'\n});\nif (!dedupeResp.ok) {\n  throw new Error(`dedupe failed: ${dedupeResp.status} ${dedupeResp.statusText}`);\n}\nconst dedupeData = await dedupeResp.json();\nif (dedupeData.deduped) {\n  return [{ json: { deduped: true, replyText: '', session: null } }];\n}\n\nconst sessionResp = await fetch(`${sessionApi}/session/${encodeURIComponent(payload.from)}`);\nlet session;\nif (sessionResp.status === 404) {\n  session = { userId: payload.from, step: 0, state: {} };\n} else if (sessionResp.ok) {\n  const sessionData = await sessionResp.json();\n  session = sessionData.session || { userId: payload.from, step: 0, state: {} };\n} else {\n  throw new Error(`session lookup failed: ${sessionResp.status} ${sessionResp.statusText}`);\n}\n\nlet step = Number(session.step ?? 0);\nconst state = { ...(session.state || {}) };\nlet replyText = '';\n\nif (step === 0) {\n  replyText = 'Hi! Welcome to onboarding. What is your full name?';\n  step = 1;\n} else if (step === 1) {\n  state.fullName = text;\n  replyText = 'Thanks. Which language would you like to continue in?';\n  step = 2;\n} else if (step === 2) {\n  state.language = text;\n  replyText = 'Great. Please share your email address.';\n  step = 3;\n} else if (step === 3) {\n  state.email = text;\n  replyText = 'What service are you interested in?';\n  step = 4;\n} else if (step === 4) {\n  state.service = text;\n  replyText = 'Thanks — your onboarding is complete.';\n  step = 5;\n} else {\n  replyText = 'You are already onboarded. Reply HELP for support.';\n}\n\nconst nextSession = { userId: payload.from, step, state };\nconst saveResp = await fetch(`${sessionApi}/session/${encodeURIComponent(payload.from)}`, {\n  method: 'POST',\n  headers: { 'Content-Type': 'application/json' },\n  body: JSON.stringify({ step: nextSession.step, state: nextSession.state })\n});\nif (!saveResp.ok) {\n  throw new Error(`session save failed: ${saveResp.status} ${saveResp.statusText}`);\n}\n\nreturn [{ json: { deduped: false, replyText, session: nextSession } }];"
       },
-      "id": "normalize-input",
-      "name": "Normalize Input",
+      "id": "process-onboarding",
+      "name": "Process Onboarding",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [480, 300]
-    },
-    {
-      "parameters": {
-        "url": "http://session-api:4000/session/{{$json.from}}",
-        "method": "GET",
-        "responseFormat": "json",
-        "options": {}
-      },
-      "id": "load-session",
-      "name": "Load Session",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4,
-      "position": [720, 300]
-    },
-    {
-      "parameters": {
-        "jsCode": "const incoming = $items('Normalize Input')[0].json;\nconst sessionResult = $input.first().json;\nconst session = sessionResult.found ? sessionResult.session : { userId: incoming.from, step: 0, state: {} };\n\nlet step = session.step ?? 0;\nlet state = session.state ?? {};\nlet replyText = '';\nconst text = (incoming.text || '').trim();\n\nif (incoming.type === 'voice') {\n  replyText = 'Thanks for the voice note. I’m processing it now.';\n}\n\nif (step === 0) {\n  replyText = 'Hi! Welcome to onboarding. What is your full name?';\n  step = 1;\n} else if (step === 1) {\n  state.fullName = text;\n  replyText = 'Thanks. Which language would you like to continue in?';\n  step = 2;\n} else if (step === 2) {\n  state.language = text;\n  replyText = 'Great. Please share your email address.';\n  step = 3;\n} else if (step === 3) {\n  state.email = text;\n  replyText = 'What service are you interested in?';\n  step = 4;\n} else if (step === 4) {\n  state.service = text;\n  replyText = 'Thanks — your onboarding is complete.';\n  step = 5;\n} else {\n  replyText = 'You are already onboarded. Reply HELP for support.';\n}\n\nreturn [{\n  json: {\n    ...incoming,\n    session: { userId: incoming.from, step, state },\n    replyText\n  }\n}];"
-      },
-      "id": "onboarding-logic",
-      "name": "Onboarding Logic",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [960, 300]
-    },
-    {
-      "parameters": {
-        "url": "http://session-api:4000/session/{{$json.session.userId}}",
-        "method": "POST",
-        "sendBody": true,
-        "contentType": "json",
-        "bodyParametersJson": "={\"step\": $json.session.step, \"state\": $json.session.state}",
-        "options": {}
-      },
-      "id": "save-session",
-      "name": "Save Session",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4,
-      "position": [1200, 300]
+      "position": [540, 300]
     },
     {
       "parameters": {
         "respondWith": "json",
-        "responseBody": "={\"replyText\": $items('Onboarding Logic')[0].json.replyText, \"session\": $items('Onboarding Logic')[0].json.session}"
+        "responseBody": "={\"deduped\": $json.deduped, \"replyText\": $json.replyText, \"session\": $json.session}"
       },
       "id": "respond",
       "name": "Respond",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1,
-      "position": [1440, 300]
+      "position": [820, 300]
     }
   ],
   "connections": {
@@ -80,47 +42,14 @@
       "main": [
         [
           {
-            "node": "Normalize Input",
+            "node": "Process Onboarding",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Normalize Input": {
-      "main": [
-        [
-          {
-            "node": "Load Session",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Load Session": {
-      "main": [
-        [
-          {
-            "node": "Onboarding Logic",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Onboarding Logic": {
-      "main": [
-        [
-          {
-            "node": "Save Session",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Save Session": {
+    "Process Onboarding": {
       "main": [
         [
           {

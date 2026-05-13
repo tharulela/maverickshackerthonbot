@@ -4,10 +4,7 @@ import { config } from "./config.js";
 import { NormalizedIncomingMessage } from "./types.js";
 import {
   createSelfieLinkPayload,
-  initialOnboardingState,
-  processOnboardingMessage,
   runOcrExtract,
-  SessionRecord,
 } from "./onboarding.js";
 
 const FALLBACK_REPLY =
@@ -29,61 +26,6 @@ function isBackendConnectivityError(error: unknown): boolean {
     text.includes("ENOTFOUND") ||
     text.includes("ETIMEDOUT")
   );
-}
-
-async function loadSession(userId: string): Promise<SessionRecord> {
-  const response = await fetch(
-    `${config.SESSION_API_URL}/session/${encodeURIComponent(userId)}`,
-  );
-
-  if (response.status === 404) {
-    return { userId, step: 0, state: initialOnboardingState() };
-  }
-
-  if (!response.ok) {
-    throw new Error(
-      `session lookup failed: ${response.status} ${response.statusText}`,
-    );
-  }
-
-  const data = (await response.json()) as {
-    found: boolean;
-    session?: SessionRecord;
-  };
-  return data.session ?? { userId, step: 0, state: initialOnboardingState() };
-}
-
-async function saveSession(session: SessionRecord): Promise<void> {
-  const response = await fetch(
-    `${config.SESSION_API_URL}/session/${encodeURIComponent(session.userId)}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ step: session.step, state: session.state }),
-    },
-  );
-
-  if (!response.ok) {
-    throw new Error(
-      `session save failed: ${response.status} ${response.statusText}`,
-    );
-  }
-}
-
-async function dedupeMessage(messageId: string): Promise<boolean> {
-  const response = await fetch(
-    `${config.SESSION_API_URL}/dedupe/${encodeURIComponent(messageId)}`,
-    { method: "POST" },
-  );
-
-  if (!response.ok) {
-    throw new Error(
-      `dedupe check failed for message ${messageId}: ${response.status} ${response.statusText}`,
-    );
-  }
-
-  const payload = (await response.json()) as { deduped: boolean };
-  return payload.deduped;
 }
 
 function isWebhookAuthorized(req: express.Request): boolean {
@@ -134,25 +76,30 @@ function webhookGuardMiddleware(
   next();
 }
 
-function stepToNumber(step: string): number {
-  const orderedSteps = [
-    "ENTRY",
-    "BUSINESS_NAME",
-    "BUSINESS_DESCRIPTION",
-    "BUSINESS_ADDRESS",
-    "ID_DOCUMENT",
-    "ID_CONFIRM",
-    "RESIDENTIAL_ADDRESS",
-    "BANK_DOCUMENT",
-    "BANK_ACCOUNT_HOLDER",
-    "BANK_CONFIRM",
-    "SELFIE_WAIT",
-    "COMPLETED",
-    "TERMINAL",
-  ];
+async function forwardToN8n(payload: NormalizedIncomingMessage) {
+  if (!config.N8N_WEBHOOK_URL) {
+    throw new Error("N8N_WEBHOOK_URL is required for n8n-first webhook mode");
+  }
 
-  const index = orderedSteps.indexOf(step);
-  return index >= 0 ? index : 0;
+  const response = await fetch(config.N8N_WEBHOOK_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(
+      `n8n webhook failed: ${response.status} ${response.statusText} ${body}`,
+    );
+  }
+
+  const data = (await response.json().catch(() => ({}))) as {
+    replyText?: string;
+    deduped?: boolean;
+  };
+
+  return data;
 }
 
 export function createServer(
@@ -219,25 +166,20 @@ export function createServer(
     try {
       logger.info(
         { payload },
-        "Processing incoming WhatsApp onboarding webhook",
+        "Forwarding incoming WhatsApp payload to n8n",
       );
+      const result = await forwardToN8n(payload);
 
-      const deduped = await dedupeMessage(payload.messageId);
-      if (deduped) {
+      if (result.deduped) {
         return res.json({ ok: true, deduped: true });
       }
 
-      const session = await loadSession(payload.from);
-      const result = await processOnboardingMessage(payload, session);
+      const replyText = result.replyText?.trim();
+      if (replyText) {
+        await sendReplyToWhatsApp(payload.from, replyText);
+      }
 
-      await saveSession({
-        userId: payload.from,
-        step: stepToNumber(result.state.step),
-        state: result.state,
-      });
-      await sendReplyToWhatsApp(payload.from, result.replyText);
-
-      res.json({ ok: true });
+      res.json({ ok: true, replyText: replyText ?? null });
     } catch (error) {
       if (isBackendConnectivityError(error)) {
         logger.warn(

@@ -12,12 +12,17 @@ async function main() {
   });
 
   await wa.onIncoming(async (msg) => {
+    if (!config.N8N_WEBHOOK_URL) {
+      logger.warn("N8N_WEBHOOK_URL is not set; skipping inbound dispatch");
+      return;
+    }
+
     const response = await fetch(
-      `http://localhost:${config.PORT}/whatsapp/webhook`,
+      config.N8N_WEBHOOK_URL,
       {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(msg)
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(msg),
       },
     );
 
@@ -27,6 +32,16 @@ async function main() {
         { status: response.status, responseBody },
         "Local webhook dispatch failed",
       );
+      return;
+    }
+
+    const result = (await response.json().catch(() => ({}))) as {
+      deduped?: boolean;
+      replyText?: string;
+    };
+
+    if (!result.deduped && result.replyText?.trim()) {
+      await wa.sendMessage(msg.from, result.replyText.trim());
     }
   });
 }
